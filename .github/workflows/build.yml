@@ -1,0 +1,272 @@
+name: Build PDFium WASM
+
+on:
+  schedule:
+    # Run weekly on Sundays at 2 AM UTC
+    # Builds ALL variants: stable, prerelease, latest
+    - cron: '0 2 * * 0'
+  
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type (single variant)'
+        type: choice
+        options:
+          - stable
+          - prerelease
+          - latest
+          - all  # Build all variants at once
+        default: stable
+        required: true
+      
+      version_override:
+        description: 'Override version (tag/branch/commit). Leave empty to auto-resolve based on build type.'
+        type: string
+        required: false
+        default: ''
+  
+  push:
+    branches: [ "main" ]
+
+# Permissions moved to top level for clarity
+permissions:
+  contents: read
+  id-token: write     # For OIDC token generation
+  attestations: write # For persisting attestations
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        run: |
+          if [ "${{ github.event_name }}" == "schedule" ] || [ "${{ github.event_name }}" == "push" ] || [ "${{ github.event.inputs.build_type }}" == "all" ]; then
+            echo 'matrix=["stable", "prerelease", "latest"]' >> $GITHUB_OUTPUT
+          else
+            echo "matrix=[\"${{ github.event.inputs.build_type }}\"]" >> $GITHUB_OUTPUT
+          fi
+
+  build:
+    needs: setup
+    runs-on: ubuntu-latest
+    
+    # Prevent concurrent builds of the same type
+    concurrency:
+      group: build-${{ matrix.build_type }}-${{ github.ref }}
+      cancel-in-progress: true
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    
+    steps:
+      - name: Checkout builder repository
+        uses: actions/checkout@v6
+
+      - name: Resolve PDFium version
+        id: resolve_version
+        uses: ./.github/actions/resolve-upstream-version
+        with:
+          build-type: ${{ matrix.build_type }}
+          version-override: ${{ github.event.inputs.version_override }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Display resolved version
+        if: steps.resolve_version.outputs.skip != 'true'
+        run: |
+          echo "::group::Build Information"
+          echo "Build Type: ${{ steps.resolve_version.outputs.build-type }}"
+          echo "Resolved Ref: ${{ steps.resolve_version.outputs.ref }}"
+          echo "Version: ${{ steps.resolve_version.outputs.version }}"
+          echo "Is Prerelease: ${{ steps.resolve_version.outputs.is-prerelease }}"
+          echo "Commit SHA: ${{ steps.resolve_version.outputs.commit-sha }}"
+          echo "::endgroup::"
+
+      - name: Free disk space
+        if: steps.resolve_version.outputs.skip != 'true'
+        run: |
+          echo "Disk space before cleanup:"
+          df -h
+          
+          # Remove large packages (more aggressive)
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/local/graalvm/
+          sudo rm -rf /usr/local/.ghcup/
+          sudo rm -rf /usr/local/share/powershell
+          sudo rm -rf /usr/local/share/chromium
+          sudo rm -rf /usr/local/lib/node_modules
+          
+          # Clean apt cache
+          sudo apt-get clean
+          sudo apt-get autoclean
+          sudo apt-get autoremove -y
+          
+          # Clean Docker (but keep our cache paths intact)
+          docker system prune -a -f || true
+          
+          echo "Disk space after cleanup:"
+          df -h
+
+      - name: Checkout PDFium source from fork
+        if: steps.resolve_version.outputs.skip != 'true'
+        uses: actions/checkout@v6
+        with:
+          repository: killbus/pdfium
+          ref: ${{ steps.resolve_version.outputs.ref }}
+          path: pdfium
+
+      - name: Configure Docker to use /mnt
+        if: steps.resolve_version.outputs.skip != 'true'
+        run: |
+          # Stop Docker
+          sudo systemctl stop docker
+          
+          # Move Docker data to /mnt (66GB available)
+          sudo mkdir -p /mnt/docker-data
+          sudo rsync -a /var/lib/docker/ /mnt/docker-data/ || true
+          
+          # Configure Docker daemon
+          echo '{
+            "data-root": "/mnt/docker-data"
+          }' | sudo tee /etc/docker/daemon.json
+          
+          # Restart Docker
+          sudo systemctl start docker
+          
+          echo "Docker now using /mnt partition:"
+          df -h /mnt
+
+      - name: Setup Docker Buildx
+        if: steps.resolve_version.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Prepare cache directories
+        if: steps.resolve_version.outputs.skip != 'true'
+        run: |
+          # Create cache directory structure with proper permissions BEFORE restore
+          sudo mkdir -p /mnt/runner-cache
+          sudo chown -R $(whoami):$(whoami) /mnt/runner-cache
+          mkdir -p /mnt/runner-cache/buildx
+          echo "Cache directory ready:"
+          ls -la /mnt/runner-cache/
+
+      - name: Restore Docker cache
+        if: steps.resolve_version.outputs.skip != 'true'
+        id: cache-docker
+        uses: actions/cache/restore@v5
+        with:
+          path: /mnt/runner-cache/buildx
+          key: buildx-${{ runner.os }}-${{ hashFiles('Dockerfile') }}
+          restore-keys: |
+            buildx-${{ runner.os }}-
+
+      - name: Build Docker image
+        if: steps.resolve_version.outputs.skip != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: pdfium-deps
+          tags: pdfium-builder:latest
+          load: true
+          cache-from: type=local,src=/mnt/runner-cache/buildx
+          cache-to: type=local,dest=/mnt/runner-cache/buildx-new,mode=max
+
+      - name: Move Docker cache
+        if: steps.resolve_version.outputs.skip != 'true'
+        run: |
+          rm -rf /mnt/runner-cache/buildx
+          mv /mnt/runner-cache/buildx-new /mnt/runner-cache/buildx || true
+
+      - name: Save Docker cache
+        if: steps.resolve_version.outputs.skip != 'true' && always()
+        uses: actions/cache/save@v5
+        with:
+          path: /mnt/runner-cache/buildx
+          key: ${{ steps.cache-docker.outputs.cache-primary-key || format('buildx-{0}-{1}', runner.os, hashFiles('Dockerfile')) }}
+
+      - name: Prepare build structure
+        if: steps.resolve_version.outputs.skip != 'true'
+        run: |
+          # Create directory structure matching build.sh expectations
+          mkdir -p packages/pdfium
+          mv pdfium packages/pdfium/pdfium-src
+          mv build packages/pdfium/build
+          mv scripts packages/pdfium/scripts
+
+      - name: Build PDFium WASM in container
+        if: steps.resolve_version.outputs.skip != 'true'
+        run: |
+          # Git safe directory configuration needed because owner differs (runner vs root)
+          docker run --rm \
+            -v $PWD:/workspace \
+            -w /workspace \
+            -e TZ=Etc/UTC \
+            pdfium-builder:latest \
+            /bin/bash -c "chmod +x /workspace/packages/pdfium/scripts/*.sh && /workspace/packages/pdfium/scripts/fix-depot-tools-wrapper.sh && git config --global --add safe.directory '*' && /workspace/packages/pdfium/scripts/build.sh"
+          
+          # Move artifacts back
+          mkdir -p dist
+          cp -r packages/pdfium/build/wasm/* dist/ || true
+          cp packages/pdfium/pdfium-src/out/wasm/obj/libpdfium.a dist/ || true
+
+      - name: Generate build metadata
+        if: steps.resolve_version.outputs.skip != 'true'
+        run: |
+          cat > dist/build-info.json <<EOF
+          {
+            "pdfium_version": "${{ steps.resolve_version.outputs.version }}",
+            "pdfium_ref": "${{ steps.resolve_version.outputs.ref }}",
+            "pdfium_commit": "${{ steps.resolve_version.outputs.commit-sha }}",
+            "pdfium_fork": "https://github.com/killbus/pdfium",
+            "build_type": "${{ steps.resolve_version.outputs.build-type }}",
+            "build_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "emscripten_version": "3.1.70",
+            "workflow_run_id": "${{ github.run_id }}",
+            "modifications": [
+              "FPDF_CreateSaveSession",
+              "FPDF_SaveNextChunk",
+              "FPDF_GetSaveProgress",
+              "FPDF_DestroySaveSession"
+            ]
+          }
+          EOF
+          
+          echo "${{ steps.resolve_version.outputs.version }}" > dist/version.txt
+          
+          echo "::group::Build Artifacts"
+          ls -lh dist/
+          cat dist/build-info.json
+          echo "::endgroup::"
+
+      - name: Upload build artifacts
+        if: steps.resolve_version.outputs.skip != 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: pdfium-wasm-dist-${{ steps.resolve_version.outputs.version }}
+          path: dist/
+          retention-days: 7
+          compression-level: 9
+      
+      - name: Upload build metadata
+        if: steps.resolve_version.outputs.skip != 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: pdfium-build-metadata-${{ steps.resolve_version.outputs.version }}
+          path: |
+            dist/build-info.json
+            dist/version.txt
+          retention-days: 7
+
+      - name: Generate SLSA provenance
+        if: steps.resolve_version.outputs.skip != 'true'
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: 'dist/**/*'

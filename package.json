@@ -1,0 +1,31 @@
+{
+  "name": "pdfium-wasm",
+  "version": "0.0.0",
+  "description": "PDFium.js with chunked save API: A PDF viewer library with memory-efficient streaming. Automated WASM build.",
+  "author": "Google Inc. (Automated build by killbus)",
+  "license": "BSD-3-Clause",
+  "keywords": [
+    "pdfium",
+    "pdf",
+    "wasm",
+    "webassembly",
+    "chunked-save",
+    "streaming"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/killbus/pdfium-mod-wasm.git"
+  },
+  "type": "module",
+  "main": "./dist/pdfium.js",
+  "types": "./dist/pdfium.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/pdfium.d.ts",
+      "default": "./dist/pdfium.js"
+    }
+  },
+  "files": [
+    "dist/"
+  ]
+}
