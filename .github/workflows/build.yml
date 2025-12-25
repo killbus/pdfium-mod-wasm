@@ -1,0 +1,199 @@
+name: Build PDFium WASM
+
+on:
+  schedule:
+    # Run weekly on Sundays at 2 AM UTC
+    # Builds ALL variants: stable, prerelease, latest
+    - cron: '0 2 * * 0'
+  
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type (single variant)'
+        type: choice
+        options:
+          - stable
+          - prerelease
+          - latest
+          - all  # Build all variants at once
+        default: stable
+        required: true
+      
+      version_override:
+        description: 'Override version (tag/branch/commit). Leave empty to auto-resolve based on build type.'
+        type: string
+        required: false
+        default: ''
+  
+  push:
+    branches: [ "main" ]
+
+# Permissions moved to top level for clarity
+permissions:
+  contents: read
+  id-token: write     # For OIDC token generation
+  attestations: write # For persisting attestations
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        run: |
+          if [ "${{ github.event_name }}" == "schedule" ] || [ "${{ github.event_name }}" == "push" ] || [ "${{ github.event.inputs.build_type }}" == "all" ]; then
+            echo 'matrix=["stable", "prerelease", "latest"]' >> $GITHUB_OUTPUT
+          else
+            echo "matrix=[\"${{ github.event.inputs.build_type }}\"]" >> $GITHUB_OUTPUT
+          fi
+
+  build:
+    needs: setup
+    runs-on: ubuntu-latest
+    
+    # Prevent concurrent builds of the same type
+    concurrency:
+      group: build-${{ matrix.build_type }}-${{ github.ref }}
+      cancel-in-progress: true
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    
+    steps:
+      - name: Checkout builder repository
+        uses: actions/checkout@v4
+
+      - name: Resolve PDFium version
+        id: resolve_version
+        uses: ./.github/actions/resolve-upstream-version
+        with:
+          build-type: ${{ matrix.build_type }}
+          version-override: ${{ github.event.inputs.version_override }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Display resolved version
+        if: steps.resolve_version.outputs.skip != 'true'
+        run: |
+          echo "::group::Build Information"
+          echo "Build Type: ${{ steps.resolve_version.outputs.build-type }}"
+          echo "Resolved Ref: ${{ steps.resolve_version.outputs.ref }}"
+          echo "Version: ${{ steps.resolve_version.outputs.version }}"
+          echo "Is Prerelease: ${{ steps.resolve_version.outputs.is-prerelease }}"
+          echo "Commit SHA: ${{ steps.resolve_version.outputs.commit-sha }}"
+          echo "::endgroup::"
+
+      - name: Setup depot_tools
+        if: steps.resolve_version.outputs.skip != 'true'
+        run: |
+          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git --depth=1
+          echo "$PWD/depot_tools" >> $GITHUB_PATH
+
+      - name: Fetch PDFium source from fork
+        if: steps.resolve_version.outputs.skip != '  true'
+        run: |
+          mkdir pdfium-build
+          cd pdfium-build
+          gclient config --unmanaged https://github.com/killbus/pdfium.git
+          gclient sync --revision=${{ steps.resolve_version.outputs.ref }} --no-history --shallow
+
+      - name: Cache Emscripten SDK
+        if: steps.resolve_version.outputs.skip != 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.emscripten_cache
+            ~/emsdk
+          key: emsdk-${{ runner.os }}-3.1.70
+          restore-keys: |
+            emsdk-${{ runner.os }}-
+
+      - name: Setup Emscripten
+        if: steps.resolve_version.outputs.skip != 'true'
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: '3.1.70'
+          actions-cache-folder: 'emsdk-cache'
+
+      - name: Configure PDFium build
+        if: steps.resolve_version.outputs.skip != 'true'
+        working-directory: pdfium-build/pdfium
+        run: |
+          gn gen out/wasm --args='
+            target_cpu="wasm"
+            is_debug=false
+            pdf_is_standalone=true
+            pdf_enable_xfa=false
+            pdf_enable_v8=false
+            pdf_use_skia=false
+            use_custom_libcxx=false
+            pdf_use_partition_alloc=false
+          '
+
+      - name: Build PDFium WASM
+        if: steps.resolve_version.outputs.skip != 'true'
+        working-directory: pdfium-build/pdfium
+        run: ninja -C out/wasm pdfium
+
+      - name: Package artifacts
+        if: steps.resolve_version.outputs.skip != 'true'
+        run: |
+          mkdir -p dist
+          
+          # Copy WASM artifacts
+          find pdfium-build/pdfium/out/wasm -name "*.wasm" -exec cp {} dist/ \;
+          cp pdfium-build/pdfium/out/wasm/obj/libpdfium.a dist/ || true
+          
+          # Create build metadata
+          cat > dist/build-info.json <<EOF
+          {
+            "pdfium_version": "${{ steps.resolve_version.outputs.version }}",
+            "pdfium_ref": "${{ steps.resolve_version.outputs.ref }}",
+            "pdfium_commit": "${{ steps.resolve_version.outputs.commit-sha }}",
+            "pdfium_fork": "https://github.com/killbus/pdfium",
+            "build_type": "${{ steps.resolve_version.outputs.build-type }}",
+            "build_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "emscripten_version": "3.1.70",
+            "workflow_run_id": "${{ github.run_id }}",
+            "modifications": [
+              "FPDF_CreateSaveSession",
+              "FPDF_SaveNextChunk",
+              "FPDF_GetSaveProgress",
+              "FPDF_DestroySaveSession"
+            ]
+          }
+          EOF
+          
+          echo "${{ steps.resolve_version.outputs.version }}" > dist/version.txt
+          
+          echo "::group::Build Artifacts"
+          ls -lh dist/
+          cat dist/build-info.json
+          echo "::endgroup::"
+
+      - name: Upload build artifacts
+        if: steps.resolve_version.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdfium-wasm-dist-${{ steps.resolve_version.outputs.version }}
+          path: dist/
+          retention-days: 7
+          compression-level: 9
+      
+      - name: Upload build metadata
+        if: steps.resolve_version.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdfium-build-metadata-${{ steps.resolve_version.outputs.version }}
+          path: |
+            dist/build-info.json
+            dist/version.txt
+          retention-days: 7
+
+      - name: Generate SLSA provenance
+        if: steps.resolve_version.outputs.skip != 'true'
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: 'dist/**/*'

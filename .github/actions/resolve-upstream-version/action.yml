@@ -1,0 +1,171 @@
+name: 'Resolve Upstream MuPDF Version'
+description: 'Determines which upstream MuPDF version to build based on build type'
+
+inputs:
+  build-type:
+    description: 'Build type: stable, prerelease, or latest'
+    required: true
+    default: 'stable'
+  
+  version-override:
+    description: 'Override version (tag/branch/commit). If provided, ignores build-type.'
+    required: false
+    default: ''
+  
+  github-token:
+    description: 'GitHub token for API calls'
+    required: true
+    default: ${{ github.token }}
+
+outputs:
+  ref:
+    description: 'Git ref to checkout (tag, branch, or commit)'
+    value: ${{ steps.resolve.outputs.ref }}
+  
+  version:
+    description: 'Cleaned version string for tagging/naming'
+    value: ${{ steps.resolve.outputs.version }}
+  
+  is-prerelease:
+    description: 'Whether this is a prerelease version (true/false)'
+    value: ${{ steps.resolve.outputs.is_prerelease }}
+  
+  commit-sha:
+    description: 'Full commit SHA for provenance'
+    value: ${{ steps.resolve.outputs.commit_sha }}
+  
+  build-type:
+    description: 'Resolved build type'
+    value: ${{ steps.resolve.outputs.build_type }}
+  
+  skip:
+    description: 'Whether this build should be skipped (true/false)'
+    value: ${{ steps.resolve.outputs.skip }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Resolve upstream version
+      id: resolve
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        BUILD_TYPE: ${{ inputs.build-type }}
+        VERSION_OVERRIDE: ${{ inputs.version-override }}
+      run: |
+        set -euo pipefail
+        
+        echo "::group::Resolving upstream MuPDF version"
+        
+        # If version override is provided, use it directly
+        if [ -n "$VERSION_OVERRIDE" ]; then
+          echo "Using version override: $VERSION_OVERRIDE"
+          echo "ref=$VERSION_OVERRIDE" >> $GITHUB_OUTPUT
+          echo "version=$VERSION_OVERRIDE" >> $GITHUB_OUTPUT
+          echo "build_type=custom" >> $GITHUB_OUTPUT
+          echo "skip=false" >> $GITHUB_OUTPUT
+          
+          if [[ "$VERSION_OVERRIDE" =~ (rc|beta|alpha|pre) ]]; then
+            echo "is_prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_prerelease=false" >> $GITHUB_OUTPUT
+          fi
+          
+          COMMIT_SHA=$(git ls-remote https://github.com/killbus/mupdf.git "$VERSION_OVERRIDE" | awk '{print $1}')
+          echo "commit_sha=$COMMIT_SHA" >> $GITHUB_OUTPUT
+          
+          echo "::endgroup::"
+          exit 0
+        fi
+        
+        # Use git to fetch tags reliably sorted by date (restoring original logic)
+        echo "Performing partial clone to fetch Git metadata..."
+        rm -rf mupdf_bare
+        git clone --filter=blob:none --bare https://github.com/killbus/mupdf.git mupdf_bare
+        
+        cd mupdf_bare
+        
+        case "$BUILD_TYPE" in
+          stable)
+            echo "Resolving latest stable release..."
+            RESOLVED_TAG=$(git for-each-ref --sort=-creatordate --format='%(refname:short)' refs/tags | grep -vE -- '-rc|-beta|-alpha|-pre' | head -n 1 || true)
+            IS_PRERELEASE="false"
+            SKIP="false"
+            ;;
+          
+          prerelease)
+            echo "Resolving latest prerelease..."
+            RESOLVED_TAG=$(git for-each-ref --sort=-creatordate --format='%(refname:short)' refs/tags | grep -E -- '-rc|-beta|-alpha|-pre' | head -n 1 || true)
+            
+            if [ -z "$RESOLVED_TAG" ]; then
+              echo "::notice::No prerelease tags found, skipping prerelease build"
+              echo "skip=true" >> $GITHUB_OUTPUT
+              echo "ref=" >> $GITHUB_OUTPUT
+              echo "version=" >> $GITHUB_OUTPUT
+              echo "is_prerelease=false" >> $GITHUB_OUTPUT
+              echo "commit_sha=" >> $GITHUB_OUTPUT
+              echo "build_type=$BUILD_TYPE" >> $GITHUB_OUTPUT
+              echo "::endgroup::"
+              exit 0
+            else
+              IS_PRERELEASE="true"
+              SKIP="false"
+            fi
+            ;;
+          
+          latest)
+            echo "Resolving latest commit from master branch..."
+            RESOLVED_TAG="master"
+            COMMIT_SHA=$(git rev-parse HEAD) # master is HEAD in bare clone
+            COMMIT_DATE=$(date -u +"%Y.%m.%d")
+            VERSION_STRING="nightly-$COMMIT_DATE"
+            IS_PRERELEASE="true"
+            
+            echo "ref=$RESOLVED_TAG" >> $GITHUB_OUTPUT
+            echo "version=$VERSION_STRING" >> $GITHUB_OUTPUT
+            echo "is_prerelease=$IS_PRERELEASE" >> $GITHUB_OUTPUT
+            echo "commit_sha=$COMMIT_SHA" >> $GITHUB_OUTPUT
+            echo "build_type=$BUILD_TYPE" >> $GITHUB_OUTPUT
+            echo "skip=false" >> $GITHUB_OUTPUT
+            
+            echo "Resolved to master branch (commit: ${COMMIT_SHA:0:7})"
+            echo "::endgroup::"
+            exit 0
+            ;;
+          
+          *)
+            echo "::error::Invalid build type: $BUILD_TYPE"
+            exit 1
+            ;;
+        esac
+        
+        if [ -z "$RESOLVED_TAG" ]; then
+          echo "::notice::No tags found, skipping $BUILD_TYPE build"
+          echo "skip=true" >> $GITHUB_OUTPUT
+          echo "ref=" >> $GITHUB_OUTPUT
+          echo "version=" >> $GITHUB_OUTPUT
+          echo "is_prerelease=false" >> $GITHUB_OUTPUT
+          echo "commit_sha=" >> $GITHUB_OUTPUT
+          echo "build_type=$BUILD_TYPE" >> $GITHUB_OUTPUT
+          echo "::endgroup::"
+          exit 0
+        fi
+        
+        # Get commit SHA
+        COMMIT_SHA=$(git rev-list -n 1 "$RESOLVED_TAG")
+        
+        # Clean version string
+        VERSION_STRING="${RESOLVED_TAG#v}"
+        
+        echo "ref=$RESOLVED_TAG" >> $GITHUB_OUTPUT
+        echo "version=$VERSION_STRING" >> $GITHUB_OUTPUT
+        echo "is_prerelease=$IS_PRERELEASE" >> $GITHUB_OUTPUT
+        echo "commit_sha=$COMMIT_SHA" >> $GITHUB_OUTPUT
+        echo "build_type=$BUILD_TYPE" >> $GITHUB_OUTPUT
+        echo "skip=$SKIP" >> $GITHUB_OUTPUT
+        
+        echo "Resolved to: $RESOLVED_TAG"
+        echo "Version: $VERSION_STRING"
+        echo "Prerelease: $IS_PRERELEASE"
+        echo "Commit: ${COMMIT_SHA:0:7}"
+        echo "::endgroup::"

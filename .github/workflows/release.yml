@@ -1,0 +1,189 @@
+name: Release to Git Branch and Create GitHub Release
+
+on:
+  workflow_run:
+    workflows: ["Build MuPDF WASM"]
+    types:
+      - completed
+    branches:
+      - main
+
+permissions:
+  contents: write
+  id-token: write  # For attestations
+
+jobs:
+  release:
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout builder repository
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event.workflow_run.id }}
+          path: artifacts/
+
+      - name: Process releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          
+          # Find all metadata directories
+          METADATA_DIRS=$(find artifacts -type d -name "mupdf-build-metadata-*")
+          
+          if [ -z "$METADATA_DIRS" ]; then
+            echo "::error::No build metadata found"
+            exit 1
+          fi
+          
+          for METADATA_DIR in $METADATA_DIRS; do
+            echo "::group::Processing $METADATA_DIR"
+            
+            METADATA_FILE="$METADATA_DIR/build-metadata.json"
+            if [ ! -f "$METADATA_FILE" ]; then
+              echo "::warning::Skipping $METADATA_DIR: build-metadata.json not found"
+              echo "::endgroup::"
+              continue
+            fi
+            
+            # Extract metadata
+            # Extract metadata
+            VERSION=$(jq -r '.mupdf_version' "$METADATA_FILE")
+            BUILD_TYPE=$(jq -r '.build_type' "$METADATA_FILE")
+            IS_PRERELEASE=$(jq -r '.is_prerelease' "$METADATA_FILE")
+            MUPDF_REF=$(jq -r '.mupdf_ref' "$METADATA_FILE")
+            MUPDF_COMMIT=$(jq -r '.mupdf_commit' "$METADATA_FILE")
+            
+            echo "Processing version: $VERSION ($BUILD_TYPE)"
+            
+            # Initialize RELEASE_VERSION with base VERSION
+            RELEASE_VERSION="$VERSION"
+            
+            # Determine branch and tag
+            case "$BUILD_TYPE" in
+              stable)
+                BRANCH_NAME="release"
+                TAG_PREFIX="v"
+                ;;
+              prerelease)
+                BRANCH_NAME="release-beta"
+                TAG_PREFIX="v"
+                ;;
+              latest|custom)
+                BRANCH_NAME="release-nightly"
+                # For nightly/custom, append short commit hash if available
+                if [ -n "$MUPDF_COMMIT" ] && [ "$MUPDF_COMMIT" != "null" ]; then
+                  SHORT_HASH=${MUPDF_COMMIT:0:7}
+                  # Avoid duplicating hash if it's already in the version string
+                  if [[ "$RELEASE_VERSION" != *"$SHORT_HASH"* ]]; then
+                    RELEASE_VERSION="${RELEASE_VERSION}-${SHORT_HASH}"
+                  fi
+                fi
+                TAG_PREFIX=""
+                ;;
+              *)
+                BRANCH_NAME="release"
+                TAG_PREFIX="v"
+                ;;
+            esac
+            
+            TAG_NAME="${TAG_PREFIX}${RELEASE_VERSION}"
+            echo "Branch: $BRANCH_NAME, Tag: $TAG_NAME"
+            
+            # Locate dist artifact (using original VERSION from metadata)
+            DIST_DIR=$(find artifacts -type d -name "mupdf-wasm-dist-$VERSION" | head -n 1)
+            if [ -z "$DIST_DIR" ]; then
+              echo "::error::No matching dist artifact for version $VERSION"
+              exit 1
+            fi
+            
+            # Prepare release directory
+            RELEASE_TEMP="release_temp_$RELEASE_VERSION"
+            rm -rf "$RELEASE_TEMP"
+            mkdir -p "$RELEASE_TEMP/dist"
+            cp -r "$DIST_DIR"/* "$RELEASE_TEMP/dist/"
+            if [ -f "package.json" ]; then
+              cp package.json "$RELEASE_TEMP/"
+            fi
+            
+            # ------------------------------------------------------------------
+            # Git Operations: Create/Update Branch
+            # ------------------------------------------------------------------
+            # We use a subshell to isolate git operations for this release
+            (
+              cd "$RELEASE_TEMP"
+              git init
+              git config user.name "github-actions[bot]"
+              git config user.email "github-actions[bot]@users.noreply.github.com"
+              
+              git checkout -b "$BRANCH_NAME"
+              
+              # Update package.json version
+              if [ -f "package.json" ]; then
+                PKG_VER="${RELEASE_VERSION#v}"
+                npm version "$PKG_VER" --no-git-tag-version --allow-same-version || true
+              fi
+              
+              git add .
+              git commit -m "chore: release build from MuPDF $MUPDF_REF
+          
+          Build Type: $BUILD_TYPE
+          Version: $RELEASE_VERSION
+          Upstream Ref: $MUPDF_REF"
+              
+              # Force push branch (overwrite previous release branch content)
+              git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+              git push --force origin "$BRANCH_NAME"
+              
+              # Tag
+              # Delete remote tag if exists (to allow updating existing releases)
+              if git ls-remote --tags origin | grep -q "refs/tags/$TAG_NAME"; then
+                echo "Deleting existing remote tag $TAG_NAME"
+                git push origin --delete "$TAG_NAME"
+              fi
+              
+              git tag "$TAG_NAME"
+              git push origin "$TAG_NAME"
+            )
+            
+            # ------------------------------------------------------------------
+            # GitHub Release Creation
+            # ------------------------------------------------------------------
+            PRERELEASE_FLAG=""
+            if [ "$IS_PRERELEASE" == "true" ]; then
+              PRERELEASE_FLAG="--prerelease"
+            fi
+            
+            TITLE="MuPDF WASM $RELEASE_VERSION"
+            NOTES="# MuPDF WASM Build
+            
+            **Build Type:** \`$BUILD_TYPE\`
+            **Upstream Version:** \`$MUPDF_REF\`
+            **Upstream Commit:** \`$MUPDF_COMMIT\`
+            
+            ## Installation
+            
+            \`\`\`bash
+            npm install github:${{ github.repository }}#$TAG_NAME
+            \`\`\`
+            
+            Built from [killbus/mupdf@$MUPDF_REF](https://github.com/killbus/mupdf/tree/$MUPDF_REF)"
+            
+            # Delete existing release if it exists to allow re-runs
+            gh release delete "$TAG_NAME" -y --cleanup-tag || true
+            
+            # Create new release
+            gh release create "$TAG_NAME" \
+              $PRERELEASE_FLAG \
+              --title "$TITLE" \
+              --notes "$NOTES" \
+              "$RELEASE_TEMP/dist"/*
+            
+            echo "::endgroup::"
+          done
