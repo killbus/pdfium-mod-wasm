@@ -1,0 +1,224 @@
+name: Release to Git Branch and Create GitHub Release
+
+on:
+  workflow_run:
+    workflows: ["PDFium WASM Build"]
+    types:
+      - completed
+    branches:
+      - main
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  release:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout builder repository
+        uses: actions/checkout@v6
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event.workflow_run.id }}
+          pattern: pdfium-wasm-build-*
+          path: artifacts/
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install pnpm
+        run: npm install -g pnpm
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Copy build artifacts to src/vendor
+        run: |
+          echo "Copying PDFium WASM artifacts to src/vendor/..."
+          mkdir -p src/vendor
+          
+          # Copy essential WASM files from build.yml artifacts
+          cp artifacts/pdfium.wasm src/vendor/
+          cp artifacts/pdfium.js src/vendor/
+          cp artifacts/pdfium.cjs src/vendor/
+          cp artifacts/functions.ts src/vendor/
+          cp artifacts/runtime-methods.ts src/vendor/
+          cp artifacts/pdfium.d.ts src/vendor/ || true
+          cp artifacts/pdfium.d.cts src/vendor/ || true
+          
+          echo "✅ WASM artifacts copied to src/vendor/"
+          ls -lh src/vendor/
+
+      - name: Build npm package
+        run: |
+          echo "Building npm package with rollup..."
+          pnpm run build
+          echo "✅ Package built successfully"
+          ls -la dist/
+
+      - name: Process PDFium release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          
+          # v7 with pattern: artifact contents are extracted directly to path/
+          ARTIFACT_DIR="artifacts"
+          
+          # Verify build-info.json exists
+          BUILD_INFO="$ARTIFACT_DIR/build-info.json"
+          if [ ! -f "$BUILD_INFO" ]; then
+            echo "::error::build-info.json not found"
+            ls -la "$ARTIFACT_DIR"/
+            exit 1
+          fi
+          
+          BUILD_MODE=$(jq -r '.build_mode' "$BUILD_INFO")
+          BUILD_TIMESTAMP=$(jq -r '.build_timestamp' "$BUILD_INFO")
+          GIT_COMMIT=$(jq -r '.git_commit' "$BUILD_INFO")
+          GIT_REF=$(jq -r '.git_ref' "$BUILD_INFO")
+          RUN_NUMBER=$(jq -r '.workflow_run_number' "$BUILD_INFO")
+          
+          SHORT_COMMIT=${GIT_COMMIT:0:7}
+          VERSION="1.0.0-${SHORT_COMMIT}"
+          
+          echo "Processing PDFium build:"
+          echo "  Version: $VERSION"
+          echo "  Build Mode: $BUILD_MODE"
+          echo "  Commit: $GIT_COMMIT"
+          
+          if [[ "$GIT_REF" == "refs/heads/main" ]]; then
+            BRANCH_NAME="release"
+            TAG_NAME="v${VERSION}"
+            IS_PRERELEASE="false"
+          else
+            BRANCH_NAME="release-dev"
+            TAG_NAME="${VERSION}"
+            IS_PRERELEASE="true"
+          fi
+          
+          echo "Branch: $BRANCH_NAME"
+          echo "Tag: $TAG_NAME"
+          
+          RELEASE_TEMP="release_temp"
+          rm -rf "$RELEASE_TEMP"
+          mkdir -p "$RELEASE_TEMP"
+          
+          if [ -d "dist" ]; then
+            cp -r dist "$RELEASE_TEMP/"
+            echo "✅ Copied built package from dist/"
+          else
+            echo "::error::dist/ directory not found after npm build"
+            exit 1
+          fi
+          
+          if [ -f "package.json" ]; then
+            cp package.json "$RELEASE_TEMP/"
+          fi
+          if [ -f "README.md" ]; then
+            cp README.md "$RELEASE_TEMP/"
+          fi
+          
+          (
+            cd "$RELEASE_TEMP"
+            git init
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            
+            git checkout -b "$BRANCH_NAME"
+            
+            if [ -f "package.json" ]; then
+              PKG_VER="${VERSION#v}"
+              npm version "$PKG_VER" --no-git-tag-version --allow-same-version || true
+            fi
+            
+            git add .
+            
+            # Commit with heredoc for better readability
+            git commit -F- <<'EOF'
+          chore: release PDFium WASM build
+          
+          Build Mode: ${BUILD_MODE}
+          Version: ${VERSION}
+          Commit: ${GIT_COMMIT}
+          Timestamp: ${BUILD_TIMESTAMP}
+          EOF
+            
+            git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+            git push --force origin "$BRANCH_NAME"
+            
+            if git ls-remote --tags origin | grep -q "refs/tags/$TAG_NAME"; then
+              echo "Deleting existing remote tag $TAG_NAME"
+              git push origin --delete "$TAG_NAME" || true
+            fi
+            
+            git tag "$TAG_NAME"
+            git push origin "$TAG_NAME"
+          )
+          
+          PRERELEASE_FLAG=""
+          if [ "$IS_PRERELEASE" == "true" ]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+          
+          TITLE="PDFium WASM $VERSION"
+          
+          gh release delete "$TAG_NAME" -y --cleanup-tag || true
+          
+          # Create release with heredoc for notes
+          gh release create "$TAG_NAME" \
+            $PRERELEASE_FLAG \
+            --title "$TITLE" \
+            --notes-file - <<EOF
+          # PDFium WASM Build
+          
+          **Build Mode:** \`${BUILD_MODE}\`
+          **Commit:** \`${GIT_COMMIT}\`
+          **Build Time:** \`${BUILD_TIMESTAMP}\`
+          
+          ## Installation
+          
+          ### Method 1: Install from Git (Recommended)
+          \`\`\`bash
+          npm install github:${{ github.repository }}#${TAG_NAME}
+          \`\`\`
+          
+          ### Method 2: Download tarball
+          Download \`pdfium-wasm-${VERSION}.tar.gz\` from release assets and extract.
+          
+          ## What's Included
+          - Compiled WASM binary (\`pdfium.wasm\`)
+          - ESM, CommonJS, and browser bundles
+          - TypeScript declaration files
+          - Source maps for debugging
+          
+          Built from commit [${SHORT_COMMIT}](https://github.com/${{ github.repository }}/commit/${GIT_COMMIT})
+          EOF
+          
+          # Create tarball from release temp (exclude .git)
+          echo "Creating release tarball..."
+          TARBALL_NAME="pdfium-wasm-${VERSION}.tar.gz"
+          tar -czf "$TARBALL_NAME" \
+            --exclude='.git' \
+            -C "$RELEASE_TEMP" .
+          
+          echo "Tarball created: $TARBALL_NAME ($(du -h "$TARBALL_NAME" | cut -f1))"
+          echo "Contents preview:"
+          tar -tzf "$TARBALL_NAME" | head -20
+          
+          # Upload tarball as the main release asset
+          # Individual files are in the tarball, no need to upload separately
+          echo "Uploading release tarball..."
+          gh release upload "$TAG_NAME" "$TARBALL_NAME"
+          
+          echo "✅ Release $TAG_NAME published successfully"
+          echo "📦 Tarball: $TARBALL_NAME"
+          echo "🔗 Install: npm install github:${{ github.repository }}#$TAG_NAME"
