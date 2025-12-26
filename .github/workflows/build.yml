@@ -1,272 +1,411 @@
-name: Build PDFium WASM
+name: PDFium WASM Build
 
 on:
-  schedule:
-    # Run weekly on Sundays at 2 AM UTC
-    # Builds ALL variants: stable, prerelease, latest
-    - cron: '0 2 * * 0'
-  
   workflow_dispatch:
     inputs:
-      build_type:
-        description: 'Build type (single variant)'
+      build_mode:
+        description: 'Build mode'
         type: choice
-        options:
-          - stable
-          - prerelease
-          - latest
-          - all  # Build all variants at once
-        default: stable
-        required: true
-      
-      version_override:
-        description: 'Override version (tag/branch/commit). Leave empty to auto-resolve based on build type.'
-        type: string
-        required: false
-        default: ''
-  
+        options: [dev, release]
+        default: release
   push:
-    branches: [ "main" ]
+    branches: [main]
+  pull_request:
+    branches: [main]
 
-# Permissions moved to top level for clarity
+# Prevent concurrent builds
+concurrency:
+  group: pdfium-build-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
-  id-token: write     # For OIDC token generation
-  attestations: write # For persisting attestations
+  actions: write
 
 jobs:
-  setup:
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
-    steps:
-      - id: set-matrix
-        run: |
-          if [ "${{ github.event_name }}" == "schedule" ] || [ "${{ github.event_name }}" == "push" ] || [ "${{ github.event.inputs.build_type }}" == "all" ]; then
-            echo 'matrix=["stable", "prerelease", "latest"]' >> $GITHUB_OUTPUT
-          else
-            echo "matrix=[\"${{ github.event.inputs.build_type }}\"]" >> $GITHUB_OUTPUT
-          fi
-
   build:
-    needs: setup
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     
-    # Prevent concurrent builds of the same type
-    concurrency:
-      group: build-${{ matrix.build_type }}-${{ github.ref }}
-      cancel-in-progress: true
-    
-    strategy:
-      fail-fast: false
-      matrix:
-        build_type: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    # CRITICAL: Fix "Argument list too long" error
+    # GitHub Actions has a bug where environment variables accumulate causing shell level overflow
+    # Solution: Use custom shell without profile/rc files to prevent variable inheritance
+    defaults:
+      run:
+        shell: bash --noprofile --norc -eo pipefail {0}
     
     steps:
-      - name: Checkout builder repository
-        uses: actions/checkout@v6
-
-      - name: Resolve PDFium version
-        id: resolve_version
-        uses: ./.github/actions/resolve-upstream-version
+      # ============ Basic Setup ============
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
-          build-type: ${{ matrix.build_type }}
-          version-override: ${{ github.event.inputs.version_override }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Display resolved version
-        if: steps.resolve_version.outputs.skip != 'true'
-        run: |
-          echo "::group::Build Information"
-          echo "Build Type: ${{ steps.resolve_version.outputs.build-type }}"
-          echo "Resolved Ref: ${{ steps.resolve_version.outputs.ref }}"
-          echo "Version: ${{ steps.resolve_version.outputs.version }}"
-          echo "Is Prerelease: ${{ steps.resolve_version.outputs.is-prerelease }}"
-          echo "Commit SHA: ${{ steps.resolve_version.outputs.commit-sha }}"
-          echo "::endgroup::"
-
+          submodules: recursive
+      
       - name: Free disk space
-        if: steps.resolve_version.outputs.skip != 'true'
         run: |
           echo "Disk space before cleanup:"
           df -h
           
-          # Remove large packages (more aggressive)
+          # Remove large unnecessary packages
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /usr/local/lib/android
           sudo rm -rf /opt/ghc
           sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-          sudo rm -rf /usr/local/share/boost
-          sudo rm -rf /usr/local/graalvm/
-          sudo rm -rf /usr/local/.ghcup/
-          sudo rm -rf /usr/local/share/powershell
-          sudo rm -rf /usr/local/share/chromium
-          sudo rm -rf /usr/local/lib/node_modules
-          
-          # Clean apt cache
+          sudo docker image prune -af
           sudo apt-get clean
-          sudo apt-get autoclean
-          sudo apt-get autoremove -y
-          
-          # Clean Docker (but keep our cache paths intact)
-          docker system prune -a -f || true
           
           echo "Disk space after cleanup:"
           df -h
-
-      - name: Checkout PDFium source from fork
-        if: steps.resolve_version.outputs.skip != 'true'
-        uses: actions/checkout@v6
-        with:
-          repository: killbus/pdfium
-          ref: ${{ steps.resolve_version.outputs.ref }}
-          path: pdfium
-
-      - name: Configure Docker to use /mnt
-        if: steps.resolve_version.outputs.skip != 'true'
+      
+      # ============ Environment Setup ============
+      # CRITICAL FIX: Do NOT write to $GITHUB_ENV to prevent "Argument list too long"
+      # GitHub Actions accumulates ALL env vars across steps, exceeding kernel ARG_MAX limit
+      # Instead: Use step-level 'env:' or inline variables where needed
+      - name: Set environment variables
         run: |
-          # Stop Docker
-          sudo systemctl stop docker
+          echo "Environment variables will be set at step level to prevent pollution"
+          echo "This prevents the 'Argument list too long' error in depot_tools"
           
-          # Move Docker data to /mnt (66GB available)
-          sudo mkdir -p /mnt/docker-data
-          sudo rsync -a /var/lib/docker/ /mnt/docker-data/ || true
-          
-          # Configure Docker daemon
-          echo '{
-            "data-root": "/mnt/docker-data"
-          }' | sudo tee /etc/docker/daemon.json
-          
-          # Restart Docker
-          sudo systemctl start docker
-          
-          echo "Docker now using /mnt partition:"
-          df -h /mnt
-
-      - name: Setup Docker Buildx
-        if: steps.resolve_version.outputs.skip != 'true'
-        uses: docker/setup-buildx-action@v3
-
-      - name: Prepare cache directories
-        if: steps.resolve_version.outputs.skip != 'true'
-        run: |
-          # Create cache directory structure with proper permissions BEFORE restore
-          sudo mkdir -p /mnt/runner-cache
-          sudo chown -R $(whoami):$(whoami) /mnt/runner-cache
-          mkdir -p /mnt/runner-cache/buildx
-          echo "Cache directory ready:"
-          ls -la /mnt/runner-cache/
-
-      - name: Restore Docker cache
-        if: steps.resolve_version.outputs.skip != 'true'
-        id: cache-docker
-        uses: actions/cache/restore@v5
+          # Variables are defined below in each step's 'env:' section
+          # Do NOT use >> $GITHUB_ENV as it causes cumulative env var bloat
+      
+      # ============ Cache Strategy ============
+      - name: Cache Emscripten SDK
+        id: cache-emsdk
+        uses: actions/cache@v4
         with:
-          path: /mnt/runner-cache/buildx
-          key: buildx-${{ runner.os }}-${{ hashFiles('Dockerfile') }}
+          path: /opt/emsdk
+          key: emsdk-3.1.70-${{ runner.os }}-v2
+      
+      - name: Cache depot_tools
+        id: cache-depot-tools
+        uses: actions/cache@v4
+        with:
+          path: /opt/depot-tools
+          key: depot-tools-${{ runner.os }}-${{ hashFiles('.github/workflows/pdfium-build.yml') }}
           restore-keys: |
-            buildx-${{ runner.os }}-
-
-      - name: Build Docker image
-        if: steps.resolve_version.outputs.skip != 'true'
-        uses: docker/build-push-action@v6
+            depot-tools-${{ runner.os }}-
+      
+      - name: Cache CIPD bootstrap
+        id: cache-cipd
+        uses: actions/cache@v4
         with:
-          context: .
-          target: pdfium-deps
-          tags: pdfium-builder:latest
-          load: true
-          cache-from: type=local,src=/mnt/runner-cache/buildx
-          cache-to: type=local,dest=/mnt/runner-cache/buildx-new,mode=max
-
-      - name: Move Docker cache
-        if: steps.resolve_version.outputs.skip != 'true'
-        run: |
-          rm -rf /mnt/runner-cache/buildx
-          mv /mnt/runner-cache/buildx-new /mnt/runner-cache/buildx || true
-
-      - name: Save Docker cache
-        if: steps.resolve_version.outputs.skip != 'true' && always()
-        uses: actions/cache/save@v5
+          path: |
+            /opt/pdfium-bootstrap
+            ~/.vpython-root
+            ~/.cipd
+          key: cipd-bootstrap-${{ runner.os }}-v2
+      
+      - name: Cache Rust toolchain
+        id: cache-rust
+        uses: actions/cache@v4
         with:
-          path: /mnt/runner-cache/buildx
-          key: ${{ steps.cache-docker.outputs.cache-primary-key || format('buildx-{0}-{1}', runner.os, hashFiles('Dockerfile')) }}
-
-      - name: Prepare build structure
-        if: steps.resolve_version.outputs.skip != 'true'
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: rust-toolchain-${{ runner.os }}-v1
+      
+      # ============ System Dependencies (from Dockerfile) ============
+      - name: Install base system packages
         run: |
-          # Create directory structure matching build.sh expectations
-          mkdir -p packages/pdfium
-          mv pdfium packages/pdfium/pdfium-src
-          mv build packages/pdfium/build
-          mv scripts packages/pdfium/scripts
-
-      - name: Build PDFium WASM in container
-        if: steps.resolve_version.outputs.skip != 'true'
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            pkg-config autoconf automake libtool ragel git yasm \
+            subversion lsb-release tzdata tini \
+            curl build-essential rsync python3 python3-pip
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+      
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      
+      # ============ Emscripten SDK 3.1.70 (from Dockerfile emsdk-base) ============
+      - name: Install Emscripten SDK 3.1.70
+        if: steps.cache-emsdk.outputs.cache-hit != 'true'
         run: |
-          # Git safe directory configuration needed because owner differs (runner vs root)
-          docker run --rm \
-            -v $PWD:/workspace \
-            -w /workspace \
-            -e TZ=Etc/UTC \
-            pdfium-builder:latest \
-            /bin/bash -c "chmod +x /workspace/packages/pdfium/scripts/*.sh && /workspace/packages/pdfium/scripts/fix-depot-tools-wrapper.sh && git config --global --add safe.directory '*' && /workspace/packages/pdfium/scripts/build.sh"
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git /opt/emsdk
+          cd /opt/emsdk
+          ./emsdk install 3.1.70 --shallow
+          ./emsdk activate 3.1.70
+      
+      - name: Setup Emscripten environment
+        run: |
+          cd /opt/emsdk
+          source ./emsdk_env.sh
           
-          # Move artifacts back
+          # Add to PATH
+          echo "/opt/emsdk" >> $GITHUB_PATH
+          echo "/opt/emsdk/upstream/emscripten" >> $GITHUB_PATH
+          echo "/opt/emsdk/upstream/bin" >> $GITHUB_PATH
+          
+          # Only export essential Emscripten vars (prevent env pollution)
+          echo "EMSDK=$EMSDK" >> $GITHUB_ENV
+          echo "EM_CONFIG=$EM_CONFIG" >> $GITHUB_ENV
+          
+          # Verify
+          emcc --version
+      
+      # ============ depot_tools (from Dockerfile depot-tools stage) ============
+      - name: Setup depot_tools
+        run: |
+          if [ ! -d "/opt/depot-tools" ]; then
+            git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git /opt/depot-tools
+          fi
+          
+          echo "/opt/depot-tools" >> $GITHUB_PATH
+          
+          # Disable auto-update
+          export DEPOT_TOOLS_UPDATE=0
+          echo "DEPOT_TOOLS_UPDATE=0" >> $GITHUB_ENV
+          
+          # Reset shell level to prevent accumulation
+          export SHLVL=1
+          
+          /opt/depot-tools/update_depot_tools || echo "update_depot_tools completed"
+          /opt/depot-tools/gclient --version
+      
+      # ============ CIPD Bootstrap (from Dockerfile pdfium-bootstrap + build.sh) ============
+      - name: Bootstrap CIPD packages
+        if: steps.cache-cipd.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /opt/pdfium-bootstrap
+          cd /opt/pdfium-bootstrap
+          
+          # Use clean environment to prevent "Argument list too long" error
+          # GitHub Actions accumulates env vars that exceed kernel ARG_MAX limit
+          env -i \
+            HOME="$HOME" \
+            PATH="/opt/depot-tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            DEPOT_TOOLS_UPDATE=0 \
+            SHLVL=1 \
+            bash -c 'gclient config --unmanaged https://pdfium.googlesource.com/pdfium.git'
+          
+          env -i \
+            HOME="$HOME" \
+            PATH="/opt/depot-tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            DEPOT_TOOLS_UPDATE=0 \
+            SHLVL=1 \
+            bash -c 'gclient sync --no-history --shallow'
+          
+          echo "✅ CIPD cache ready"
+      
+      # ============ PDFium Build Dependencies (from Dockerfile pdfium-deps) ============
+      - name: Install PDFium build dependencies
+        run: |
+          cd /opt/pdfium-bootstrap
+          bash -x ./pdfium/build/install-build-deps.sh --no-prompt
+      
+      # ============ Rust toolchain (from Dockerfile pdfium-deps) ============
+      - name: Install Rust toolchain with watchexec
+        if: steps.cache-rust.outputs.cache-hit != 'true'
+        run: |
+          curl -sSf https://sh.rustup.rs | bash -s -- -y
+          source "$HOME/.cargo/env"
+          cargo install --locked watchexec-cli
+          strip "$HOME/.cargo/bin/watchexec"
+          rm -rf "$HOME/.cargo/registry" "$HOME/.cargo/git"
+      
+      - name: Add Rust to PATH
+        run: |
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      
+      # ============ Prepare Build Structure ============
+      - name: Create build directories
+        run: |
+          mkdir -p packages/pdfium/pdfium-src/out/wasm
+          mkdir -p /opt/work/pdfium-src
+      
+      # ============ gclient Sync (from build.sh step 0) ============
+      - name: Sync PDFium dependencies
+        env:
+          SRC: ${{ github.workspace }}/packages/pdfium/pdfium-src
+        run: |
+          cd $GITHUB_WORKSPACE
+          
+          # Check if toolchain already exists
+          if [[ ! -d "$SRC/third_party/llvm-build" ]]; then
+            echo "⏬ First-time gclient sync..."
+            
+            cat > "$GITHUB_WORKSPACE/.gclient" <<'EOF'
+          solutions = [
+            { "name": "packages/pdfium/pdfium-src",
+              "url":  "https://pdfium.googlesource.com/pdfium.git",
+              "deps_file": "DEPS",
+              "managed": False,
+              "custom_deps": {},
+            },
+          ]
+          EOF
+            
+            # Clean environment for gclient to prevent argument list overflow
+            env -i \
+              HOME="$HOME" \
+              PATH="/opt/depot-tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+              DEPOT_TOOLS_UPDATE=0 \
+              SHLVL=1 \
+              bash -c 'cd packages/pdfium/pdfium-src && gclient sync --no-history --shallow --nohooks --deps=builder'
+            
+            rm "$GITHUB_WORKSPACE/.gclient"
+          else
+            echo "✅ Toolchain already synced"
+          fi
+      
+      # ============ Apply Build Patches (from build.sh 0.5) ============
+      - name: Apply build patches
+        env:
+          PDFIUM: ${{ github.workspace }}/packages/pdfium
+          SRC: ${{ github.workspace }}/packages/pdfium/pdfium-src
+        run: |
+          echo "🔧 Patching PDFium build files..."
+          
+          # Copy patched build configs
+          cp -f "$PDFIUM/build/patch/build/config/BUILDCONFIG.gn" \
+                "$SRC/build/config/BUILDCONFIG.gn" || echo "No BUILDCONFIG.gn patch"
+          
+          cp -f "$PDFIUM/build/patch/build/toolchain/wasm/BUILD.gn" \
+                "$SRC/build/toolchain/wasm/BUILD.gn" || echo "No BUILD.gn patch"
+      
+      # ============ GN Generate (from build.sh) ============
+      - name: Generate build configuration with GN
+        run: |
+          # Define paths inline to avoid environment pollution
+          WORKSPACE="$GITHUB_WORKSPACE"
+          SRC="$WORKSPACE/packages/pdfium/pdfium-src"
+          OUT="$SRC/out/wasm"
+          
+          if [[ ! -f "$OUT/args.gn" ]]; then
+            echo "🏗️ Generating GN build configuration..."
+            
+            # CRITICAL: Use clean environment with paths defined INSIDE bash -c
+            # This prevents GitHub Actions environment pollution from exceeding ARG_MAX
+            env -i \
+              HOME="$HOME" \
+              PATH="/opt/depot-tools:/opt/emsdk/upstream/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+              DEPOT_TOOLS_UPDATE=0 \
+              EMSDK="/opt/emsdk" \
+              EM_CONFIG="/opt/emsdk/.emscripten" \
+              SHLVL=1 \
+              bash -c "\
+                SRC='$SRC'\
+                OUT='$OUT'\
+                gn gen \$OUT --root \$SRC --args='is_debug=false treat_warnings_as_errors=false pdf_use_skia=false pdf_enable_xfa=false pdf_enable_v8=false is_component_build=false clang_use_chrome_plugins=false pdf_is_standalone=true use_debug_fission=false use_custom_libcxx=false use_sysroot=false pdf_is_complete_lib=true pdf_use_partition_alloc=false is_clang=false symbol_level=0'\
+              "
+            
+            # Append WASM target config
+            { echo 'target_os="wasm"'; echo 'target_cpu="wasm"'; } >> "$OUT/args.gn"
+          else
+            echo "✅ GN already configured"
+          fi
+      
+      # ============ Build PDFium with Ninja (from build.sh) ============
+      - name: Build PDFium WASM
+        env:
+          SRC: ${{ github.workspace }}/packages/pdfium/pdfium-src
+          OUT: ${{github.workspace }}/packages/pdfium/pdfium-src/out/wasm
+        run: |
+          echo "🛠️ Building PDFium..."
+          
+          # Ninja is a real binary, but use minimal env for consistency and safety
+          env -i \
+            HOME="$HOME" \
+            PATH="/opt/depot-tools:/opt/emsdk/upstream/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            EMSDK="/opt/emsdk" \
+            bash -c "cd '$SRC' && ninja -C '$OUT' pdfium -v"
+        timeout-minutes: 60
+      
+      # ============ Generate Exports (from build.sh gen_exports) ============
+      - name: Generate export lists
+        env:
+          PDFIUM: ${{ github.workspace }}/packages/pdfium
+          SRC: ${{ github.workspace }}/packages/pdfium/pdfium-src
+        run: |
+          cd $GITHUB_WORKSPACE
+          
+          WS=$PDFIUM/build/wasm
+          rm -rf "$WS" && mkdir -p "$WS"
+          
+          # Generate all.h with public headers
+          ( cd "$SRC" &&
+            find public -path public/cpp -prune -o -name '*.h' -print |
+            sort | sed 's|^|#include "|;s|$|"|' ) > "$WS/all.h"
+          
+          # Add custom extension API
+          echo '#include "../build/code/cpp/ext_api.h"' >> "$WS/all.h"
+          
+          # Generate AST
+          clang -std=c11 -I"$SRC" -I"$GITHUB_WORKSPACE/build/code/cpp" \
+                -fsyntax-only -Xclang -ast-dump=json "$WS/all.h" > "$WS/ast.json"
+          
+          # Run generator scripts
+          node "$PDFIUM/build/generate-functions.mjs" "$WS/ast.json" "$WS"
+          node "$PDFIUM/build/generate-runtime-methods.mjs" "$WS"
+      
+      # ============ Compile WASM outputs (from build.sh) ============
+      - name: Compile WASM artifacts
+        env:
+          PDFIUM: ${{ github.workspace }}/packages/pdfium
+        run: |
+          cd "$PDFIUM/build"
+          
+          # Generate ESM and CJS outputs
+          bash ./compile.esm.sh
+          bash ./compile.sh
+          
+          # Copy to vendor directory
+          mkdir -p "$PDFIUM/src/vendor"
+          cp -f ./wasm/{runtime-methods.ts,functions.ts,pdfium.wasm,pdfium.js,pdfium.cjs} "$PDFIUM/src/vendor/"
+          
+          echo "✅ pdfium.wasm (ESM + CJS) ready"
+      
+      # ============ Collect Artifacts ============
+      - name: Collect build artifacts
+        run: |
           mkdir -p dist
+          
+          # Copy WASM build outputs
           cp -r packages/pdfium/build/wasm/* dist/ || true
           cp packages/pdfium/pdfium-src/out/wasm/obj/libpdfium.a dist/ || true
-
-      - name: Generate build metadata
-        if: steps.resolve_version.outputs.skip != 'true'
-        run: |
+          
+          # Copy vendor outputs
+          cp -r packages/pdfium/src/vendor/* dist/ || true
+          
+          # Generate metadata
           cat > dist/build-info.json <<EOF
           {
-            "pdfium_version": "${{ steps.resolve_version.outputs.version }}",
-            "pdfium_ref": "${{ steps.resolve_version.outputs.ref }}",
-            "pdfium_commit": "${{ steps.resolve_version.outputs.commit-sha }}",
-            "pdfium_fork": "https://github.com/killbus/pdfium",
-            "build_type": "${{ steps.resolve_version.outputs.build-type }}",
+            "build_mode": "${{ github.event.inputs.build_mode || 'release' }}",
             "build_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
             "emscripten_version": "3.1.70",
             "workflow_run_id": "${{ github.run_id }}",
-            "modifications": [
-              "FPDF_CreateSaveSession",
-              "FPDF_SaveNextChunk",
-              "FPDF_GetSaveProgress",
-              "FPDF_DestroySaveSession"
-            ]
+            "workflow_run_number": "${{ github.run_number }}",
+            "git_commit": "${{ github.sha }}",
+            "git_ref": "${{ github.ref }}",
+            "repository": "${{ github.repository }}"
           }
           EOF
           
-          echo "${{ steps.resolve_version.outputs.version }}" > dist/version.txt
-          
           echo "::group::Build Artifacts"
-          ls -lh dist/
+          ls -lhR dist/
           cat dist/build-info.json
           echo "::endgroup::"
-
+      
       - name: Upload build artifacts
-        if: steps.resolve_version.outputs.skip != 'true'
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
-          name: pdfium-wasm-dist-${{ steps.resolve_version.outputs.version }}
+          name: pdfium-wasm-build-${{ github.run_number }}
           path: dist/
           retention-days: 7
           compression-level: 9
       
-      - name: Upload build metadata
-        if: steps.resolve_version.outputs.skip != 'true'
-        uses: actions/upload-artifact@v6
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          name: pdfium-build-metadata-${{ steps.resolve_version.outputs.version }}
+          name: build-logs-${{ github.run_number }}
           path: |
-            dist/build-info.json
-            dist/version.txt
-          retention-days: 7
-
-      - name: Generate SLSA provenance
-        if: steps.resolve_version.outputs.skip != 'true'
-        uses: actions/attest-build-provenance@v3
-        with:
-          subject-path: 'dist/**/*'
+            packages/pdfium/pdfium-src/out/wasm/*.log
+            packages/pdfium/build/wasm/*.log
+          if-no-files-found: ignore
+          retention-days: 3

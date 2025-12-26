@@ -2,7 +2,9 @@
 set -euo pipefail
 set -x   # verbose – remove once everything works smoothly
 
-ROOT=/workspace
+# GitHub Actions native build
+# ROOT is set by the workflow, default to current directory if not set
+ROOT=${ROOT:-$PWD}
 SRC=$ROOT/packages/pdfium/pdfium-src
 OUT=$SRC/out/wasm
 WORK=/opt/work/pdfium-src

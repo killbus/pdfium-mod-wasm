@@ -2,7 +2,9 @@
 set -euo pipefail
 set -x
 
-ROOT=/workspace
+# GitHub Actions native build
+# ROOT is set by the workflow, default to current directory if not set
+ROOT=${ROOT:-$PWD}
 SRC=$ROOT/packages/pdfium/pdfium-src
 OUT=$SRC/out/wasm
 PDFIUM=$ROOT/packages/pdfium
@@ -13,27 +15,27 @@ export ROOT SRC OUT PDFIUM
 export PATH="$HOME/.cargo/bin:$PATH"
 
 ###############################################################################
-# step 0 – make sure tool-chain & GN args exist (same logic as dev.sh)
+# step 0 – Verify dependencies exist
 ###############################################################################
 if [[ ! -d "$SRC/third_party/llvm-build" ]]; then
-  echo "⏬  First-time gclient sync…"
-  cat > "$ROOT/.gclient" <<'EOF'
-solutions = [
-  { "name": "packages/pdfium/pdfium-src",
-    "url":  "https://pdfium.googlesource.com/pdfium.git",
-    "deps_file": "DEPS",
-    "managed": False,
-    "custom_deps": {},
-  },
-]
-EOF
-  ( cd "$SRC" && gclient sync --no-history --shallow --nohooks --deps=builder )
-  rm "$ROOT/.gclient"
+  echo "❌ ERROR: PDFium dependencies not found!"
+  echo "   Expected dependencies should be synced by workflow's gclient sync step"
+  echo "   Please ensure the workflow completed gclient sync successfully"
+  exit 1
 fi
 
+echo "✅ PDFium dependencies found"
+
+
 if [[ ! -f "$OUT/args.gn" ]]; then
-  gn gen "$OUT" --root "$SRC" --args='is_debug=false treat_warnings_as_errors=false pdf_use_skia=false pdf_enable_xfa=false pdf_enable_v8=false is_component_build=false clang_use_chrome_plugins=false pdf_is_standalone=true use_debug_fission=false use_custom_libcxx=false use_sysroot=false pdf_is_complete_lib=true pdf_use_partition_alloc=false is_clang=false symbol_level=0'
+  # Note: Real gn binary has different parameter parsing than wrapper
+  # Use --root first, then output directory, then --args
+  cd "$SRC"
+  gn gen "$OUT" \
+    --root=. \
+    --args='is_debug=false treat_warnings_as_errors=false pdf_use_skia=false pdf_enable_xfa=false pdf_enable_v8=false is_component_build=false clang_use_chrome_plugins=false pdf_is_standalone=true use_debug_fission=false use_custom_libcxx=false use_sysroot=false pdf_is_complete_lib=true pdf_use_partition_alloc=false is_clang=false symbol_level=0'
   { echo 'target_os="wasm"'; echo 'target_cpu="wasm"'; } >> "$OUT/args.gn"
+  cd "$ROOT"
 fi
 
 ###############################################################################
