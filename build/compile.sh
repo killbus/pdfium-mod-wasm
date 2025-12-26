@@ -1,5 +1,5 @@
 em++ $(ls ./code/cpp/*.cpp) \
-  /workspace/packages/pdfium/pdfium-src/out/wasm/obj/libpdfium.a \
+  ${OUT}/obj/libpdfium.a \
   -g \
   -v \
   -sENVIRONMENT=node,worker,web,shell \
@@ -13,8 +13,8 @@ em++ $(ls ./code/cpp/*.cpp) \
   -sEXPORTED_RUNTIME_METHODS=$(cat ./wasm/exported-runtime-methods.txt) \
   -sEXPORTED_FUNCTIONS=$(cat ./wasm/exported-functions.txt) \
   -lpdfium \
-  -L/workspace/packages/pdfium/pdfium-src/out/wasm/obj \
-  -I/workspace/packages/pdfium/pdfium-src/public \
+  -L${OUT}/obj \
+  -I${SRC}/public \
   -std=c++11 \
   -Wall \
   --no-entry \

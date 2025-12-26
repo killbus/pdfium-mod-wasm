@@ -1,0 +1,229 @@
+name: PDFium WASM Build (Docker)
+
+on:
+  # Temporarily disabled - use build.yml instead
+  # workflow_dispatch:
+  #   inputs:
+  #     build_mode:
+  #       description: 'Build mode'
+  #       type: choice
+  #       options: [dev, release]
+  #       default: release
+  # push:
+  #   branches: [main]
+  # pull_request:
+  #   branches: [main]
+
+# Prevent concurrent builds
+concurrency:
+  group: pdfium-docker-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    
+    steps:
+      # ============ Basic Setup ============
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      
+      - name: Free disk space
+        run: |
+          echo "Disk space before cleanup:"
+          df -h
+          
+          # Remove large unnecessary packages
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          sudo apt-get clean
+          
+          echo "Disk space after cleanup:"
+          df -h
+      
+      # ============ Configure Docker to use /mnt ============
+      - name: Setup Docker data directory on /mnt
+        run: |
+          # Create /mnt/docker directory
+          sudo mkdir -p /mnt/docker
+          sudo chmod 755 /mnt/docker
+          
+          echo "✅ /mnt/docker created"
+      
+      - name: Configure Docker daemon
+        run: |
+          # Create or update daemon.json to use /mnt as data-root
+          sudo mkdir -p /etc/docker
+          
+          cat <<EOF | sudo tee /etc/docker/daemon.json
+          {
+            "data-root": "/mnt/docker",
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "10m",
+              "max-file": "3"
+            },
+            "storage-driver": "overlay2"
+          }
+          EOF
+          
+          echo "✅ Docker daemon configured"
+      
+      - name: Restart Docker daemon
+        run: |
+          sudo systemctl restart docker
+          
+          # Wait for Docker to be ready
+          timeout 30 bash -c 'until docker info >/dev/null 2>&1; do sleep 1; done'
+          
+          # Verify configuration
+          DOCKER_ROOT=$(docker info --format '{{.DockerRootDir}}')
+          echo "Docker Root Dir: $DOCKER_ROOT"
+          
+          if [[ "$DOCKER_ROOT" != "/mnt/docker" ]]; then
+            echo "❌ Docker root directory not set correctly"
+            exit 1
+          fi
+          
+          # Check /mnt disk space
+          df -h /mnt
+          
+          echo "✅ Docker daemon restarted and verified"
+      
+      # ============ Docker Setup ============
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
+      
+      # ============ Cache Strategy (restore-only, save separately) ============
+      - name: Restore Docker layers cache
+        uses: actions/cache/restore@v4
+        id: cache-docker-restore
+        with:
+          path: /tmp/.buildx-cache
+          key: docker-buildx-${{ runner.os }}-${{ hashFiles('Dockerfile', 'build/patch/**/*') }}
+          restore-keys: |
+            docker-buildx-${{ runner.os }}-
+      
+      # ============ Build Docker Image (from Dockerfile) ============
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          target: pdfium-deps
+          platforms: linux/amd64
+          tags: pdfium-build:latest
+          load: true
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+          build-args: |
+            DEBIAN_FRONTEND=noninteractive
+      
+      # Workaround for buildx cache issue
+      # https://github.com/docker/build-push-action/issues/252
+      - name: Move Docker cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+      
+      # ============ Run Build in Docker Container ============
+      # Note: build.sh now handles PDFium fork clone internally
+      - name: Run PDFium build in Docker container
+        run: |
+          docker run --rm \
+            --platform linux/amd64 \
+            --workdir /workspace \
+            -v ${{ github.workspace }}:/workspace:delegated \
+            -e ROOT=/workspace \
+            -e SRC=/workspace/pdfium-src \
+            -e OUT=/workspace/pdfium-src/out/wasm \
+            -e PDFIUM=/workspace \
+            -e TZ=Etc/UTC \
+            --memory=8g \
+            --memory-swap=10g \
+            --entrypoint /usr/bin/tini \
+            pdfium-build:latest \
+            -- /workspace/scripts/build.sh
+        timeout-minutes: 90
+      
+      # ============ Post-Build Cleanup ============
+      - name: Fix artifact permissions
+        run: |
+          # Container runs as root, fix permissions for artifact collection
+          sudo chown -R $(id -u):$(id -g) pdfium-src/out || true
+          sudo chown -R $(id -u):$(id -g) build || true
+          sudo chown -R $(id -u):$(id -g) src/vendor || true
+      
+      # ============ Collect Artifacts ============
+      - name: Collect build artifacts
+        run: |
+          mkdir -p dist
+          
+          # Copy WASM build outputs
+          cp -r build/wasm/* dist/ 2>/dev/null || true
+          
+          # Copy vendor outputs
+          cp -r src/vendor/* dist/ 2>/dev/null || true
+          
+          # Copy static library
+          cp pdfium-src/out/wasm/obj/libpdfium.a dist/ 2>/dev/null || true
+          
+          # Generate metadata
+          cat > dist/build-info.json <<EOF
+          {
+            "build_mode": "${{ github.event.inputs.build_mode || 'release' }}",
+            "build_method": "docker",
+            "build_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "emscripten_version": "3.1.70",
+            "workflow_run_id": "${{ github.run_id }}",
+            "workflow_run_number": "${{ github.run_number }}",
+            "git_commit": "${{ github.sha }}",
+            "git_ref": "${{ github.ref }}",
+            "repository": "${{ github.repository }}"
+          }
+          EOF
+          
+          echo "::group::Build Artifacts"
+          ls -lhR dist/
+          cat dist/build-info.json
+          echo "::endgroup::"
+      
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdfium-wasm-docker-${{ github.run_number }}
+          path: dist/
+          retention-days: 7
+          compression-level: 9
+      
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-docker-${{ github.run_number }}
+          path: |
+            pdfium-src/out/wasm/*.log
+            build/wasm/*.log
+          if-no-files-found: ignore
+          retention-days: 3
+      
+      # ============ Save Caches (always, even on failure) ============
+      - name: Save Docker layers cache
+        uses: actions/cache/save@v4
+        if: always() && steps.cache-docker-restore.outputs.cache-hit != 'true'
+        with:
+          path: /tmp/.buildx-cache
+          key: docker-buildx-${{ runner.os }}-${{ hashFiles('Dockerfile', 'build/patch/**/*') }}

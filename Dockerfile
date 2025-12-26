@@ -15,16 +15,16 @@ ENV  PKG_CONFIG_PATH=$PKG_CONFIG_PATH:$EM_PKG_CONFIG_PATH
 ENV  PATH="/emsdk/upstream/bin:${PATH}"
 
 # --------------------------------------------------------------------------- #
-# 1.  Base packages + locale & timezone
+# 1.  Base packages + locale & timezone (merged to reduce layers)
 # --------------------------------------------------------------------------- #
 RUN  apt-get update && \
      apt-get install -y --no-install-recommends \
          pkg-config autoconf automake libtool ragel git yasm \
-         subversion lsb-release tzdata keyboard-configuration tini python3 && \
+         subversion lsb-release tzdata keyboard-configuration tini && \
+     apt-get clean && rm -rf /var/lib/apt/lists/* && \
      echo "America/Sao_Paulo" >/etc/timezone && \
      dpkg-reconfigure -f noninteractive tzdata && \
-     printf 'LANG="en_US.UTF-8"\n' >/etc/default/locale && \
-     apt-get clean && rm -rf /var/lib/apt/lists/*
+     printf 'LANG="en_US.UTF-8"\n' >/etc/default/local
 
 # --------------------------------------------------------------------------- #
 # 2.  Node.js – needed by the generator scripts.
@@ -37,20 +37,13 @@ RUN  curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && \
 # ──────────────────────────────────────────────────────────────────────────────
 # 3.  depot_tools – GN / Ninja / gclient live here.
 # ──────────────────────────────────────────────────────────────────────────────
-# 3.  depot_tools – GN / Ninja / gclient live here.
-# ──────────────────────────────────────────────────────────────────────────────
 FROM node-setup AS depot-tools
-# Clone and bootstrap first (uses system python3)
 RUN  git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git \
-         -b main /opt/depot-tools && \
-     /opt/depot-tools/update_depot_tools
-
-# Disable updates for runtime to prevent recursion
-ENV DEPOT_TOOLS_UPDATE=0
+         -b main /opt/depot-tools
 ENV  PATH=${PATH}:/opt/depot-tools
 
 FROM depot-tools AS pdfium-bootstrap
-# Work in a throw-away dir so our fork isn't required yet
+# Bootstrap CIPD cache (merged RUN to reduce layers)
 WORKDIR /opt/pdfium-bootstrap
 
 # Ask for *just* the minimal deps
@@ -58,7 +51,7 @@ RUN gclient config --unmanaged https://pdfium.googlesource.com/pdfium.git && \
     gclient sync --no-history --shallow
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 5.  Install PDFium build dependencies.
+# 5.  Install PDFium build dependencies + Rust (merged to reduce layers)
 # ──────────────────────────────────────────────────────────────────────────────
 FROM pdfium-bootstrap AS pdfium-deps
 RUN  bash -x ./pdfium/build/install-build-deps.sh --no-prompt && \

@@ -2,10 +2,12 @@
 set -euo pipefail
 set -x
 
-ROOT=/workspace
-SRC=$ROOT/packages/pdfium/pdfium-src
+# GitHub Actions native build
+# ROOT is set by the workflow, default to current directory if not set
+ROOT=${ROOT:-$PWD}
+SRC=$ROOT/pdfium-src
 OUT=$SRC/out/wasm
-PDFIUM=$ROOT/packages/pdfium
+PDFIUM=$ROOT
 
 mkdir -p $OUT
 
@@ -19,7 +21,7 @@ if [[ ! -d "$SRC/third_party/llvm-build" ]]; then
   echo "⏬  First-time gclient sync…"
   cat > "$ROOT/.gclient" <<'EOF'
 solutions = [
-  { "name": "packages/pdfium/pdfium-src",
+  { "name": "pdfium-src",
     "url":  "https://pdfium.googlesource.com/pdfium.git",
     "deps_file": "DEPS",
     "managed": False,
@@ -29,15 +31,16 @@ solutions = [
 EOF
   ( cd "$SRC" && gclient sync --no-history --shallow --nohooks --deps=builder )
   rm "$ROOT/.gclient"
+  ls -la "$ROOT"
+  ls "$SRC/" -la
 fi
 
 if [[ ! -f "$OUT/args.gn" ]]; then
-  gn gen "$OUT" --root "$SRC" --args='is_debug=false treat_warnings_as_errors=false pdf_use_skia=false pdf_enable_xfa=false pdf_enable_v8=false is_component_build=false clang_use_chrome_plugins=false pdf_is_standalone=true use_debug_fission=false use_custom_libcxx=false use_sysroot=false pdf_is_complete_lib=true pdf_use_partition_alloc=false is_clang=false symbol_level=0'
+  ( cd "$SRC" &&
+    gn gen "$OUT" --root="$SRC" --args='is_debug=false treat_warnings_as_errors=false pdf_use_skia=false pdf_enable_xfa=false pdf_enable_v8=false is_component_build=false clang_use_chrome_plugins=false pdf_is_standalone=true use_debug_fission=false use_custom_libcxx=false use_sysroot=false pdf_is_complete_lib=true pdf_use_partition_alloc=false is_clang=false symbol_level=0')
   { echo 'target_os="wasm"'; echo 'target_cpu="wasm"'; } >> "$OUT/args.gn"
 fi
 
-###############################################################################
-# 0.5 Apply our local build-system patches (always, they’re tiny)
 ###############################################################################
 echo "🔧  Patching PDFium build files…"
 cp -f "$PDFIUM/build/patch/build/config/BUILDCONFIG.gn" \
@@ -50,7 +53,7 @@ cp -f "$PDFIUM/build/patch/build/toolchain/wasm/BUILD.gn" \
 # helper – same exporter as in dev.sh
 ###############################################################################
 gen_exports() {
-  local WS=$ROOT/packages/pdfium/build/wasm
+  local WS=$ROOT/build/wasm
   rm -rf "$WS" && mkdir -p "$WS"
 
   ( cd "$SRC" &&
