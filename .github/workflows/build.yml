@@ -52,7 +52,7 @@ jobs:
     steps:
       # ============ Basic Setup ============
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       
       # ============ Clone PDFium Fork (MUST BE FIRST - before cache & mkdir) ============
       - name: Clone PDFium fork
@@ -90,14 +90,14 @@ jobs:
       # ============ Cache Strategy (restore-only, save separately) ============
       - name: Restore Emscripten SDK cache
         id: cache-emsdk
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: /opt/emsdk
           key: emsdk-3.1.70-${{ runner.os }}-v2
       
       - name: Restore depot_tools cache
         id: cache-depot-tools
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: /opt/depot-tools
           key: depot-tools-${{ runner.os }}-${{ hashFiles('.github/workflows/build.yml') }}
@@ -106,7 +106,7 @@ jobs:
       
       - name: Restore CIPD bootstrap cache
         id: cache-cipd
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: |
             /opt/pdfium-bootstrap
@@ -116,7 +116,7 @@ jobs:
       
       - name: Restore Rust toolchain cache
         id: cache-rust
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: |
             ~/.cargo/bin
@@ -136,7 +136,7 @@ jobs:
           sudo rm -rf /var/lib/apt/lists/*
       
       - name: Setup Node.js 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: '22'
       
@@ -246,7 +246,7 @@ jobs:
           echo "::endgroup::"
       
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: pdfium-wasm-build-${{ github.run_number }}
           path: dist/
@@ -255,7 +255,7 @@ jobs:
       
       - name: Upload build logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: build-logs-${{ github.run_number }}
           path: |
@@ -266,21 +266,21 @@ jobs:
       
       # ============ Save Caches (always, even on failure) ============
       - name: Save Emscripten SDK cache
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         if: always() && steps.cache-emsdk.outputs.cache-hit != 'true'
         with:
           path: /opt/emsdk
           key: emsdk-3.1.70-${{ runner.os }}-v2
       
       - name: Save depot_tools cache
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         if: always() && steps.cache-depot-tools.outputs.cache-hit != 'true'
         with:
           path: /opt/depot-tools
           key: depot-tools-${{ runner.os }}-${{ hashFiles('.github/workflows/pdfium-build.yml') }}
       
       - name: Save CIPD bootstrap cache
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         if: always() && steps.cache-cipd.outputs.cache-hit != 'true'
         with:
           path: |
@@ -290,7 +290,7 @@ jobs:
           key: cipd-bootstrap-${{ runner.os }}-v2
       
       - name: Save Rust toolchain cache
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         if: always() && steps.cache-rust.outputs.cache-hit != 'true'
         with:
           path: |

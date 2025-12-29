@@ -31,7 +31,7 @@ jobs:
     steps:
       # ============ Basic Setup ============
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       
       
       - name: Free disk space
@@ -109,7 +109,7 @@ jobs:
       
       # ============ Cache Strategy (restore-only, save separately) ============
       - name: Restore Docker layers cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         id: cache-docker-restore
         with:
           path: /tmp/.buildx-cache
@@ -119,7 +119,7 @@ jobs:
       
       # ============ Build Docker Image (from Dockerfile) ============
       - name: Build Docker image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
@@ -202,7 +202,7 @@ jobs:
           echo "::endgroup::"
       
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: pdfium-wasm-docker-${{ github.run_number }}
           path: dist/
@@ -211,7 +211,7 @@ jobs:
       
       - name: Upload build logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: build-logs-docker-${{ github.run_number }}
           path: |
@@ -222,7 +222,7 @@ jobs:
       
       # ============ Save Caches (always, even on failure) ============
       - name: Save Docker layers cache
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         if: always() && steps.cache-docker-restore.outputs.cache-hit != 'true'
         with:
           path: /tmp/.buildx-cache
