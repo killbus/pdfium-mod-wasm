@@ -11,6 +11,7 @@ em++ $(ls ./code/cpp/*.cpp) \
   -sUSE_ZLIB=1 \
   -sASSERTIONS=1 \
   -sEXPORTED_RUNTIME_METHODS=$(cat ./wasm/exported-runtime-methods.txt) \
+  -lworkerfs.js \
   -sEXPORTED_FUNCTIONS=$(cat ./wasm/exported-functions.txt) \
   -lpdfium \
   -L${OUT}/obj \

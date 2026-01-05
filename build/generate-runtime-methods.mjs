@@ -30,11 +30,13 @@ const methods = [
   'addFunction',
   'ccall',
   'cwrap',
+  'FS',
   'getValue',
   'removeFunction',
   'setValue',
   'stringToUTF16',
-  'stringToUTF8'
+  'stringToUTF8',
+  'WORKERFS'
 ];
 
 /**
