@@ -154,14 +154,11 @@ jobs:
             
             git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
             git push --force origin "$BRANCH_NAME"
-            
-            if git ls-remote --tags origin | grep -q "refs/tags/$TAG_NAME"; then
-              echo "Deleting existing remote tag $TAG_NAME"
-              git push origin --delete "$TAG_NAME" || true
-            fi
-            
-            git tag "$TAG_NAME"
-            git push origin "$TAG_NAME"
+
+            # Force update the tag to point to this new artifact commit
+            echo "Pushing tag $TAG_NAME to point to artifact commit..."
+            git tag --force "$TAG_NAME"
+            git push --force origin "$TAG_NAME"
           )
           
           PRERELEASE_FLAG=""
@@ -222,3 +219,25 @@ jobs:
           echo "✅ Release $TAG_NAME published successfully"
           echo "📦 Tarball: $TARBALL_NAME"
           echo "🔗 Install: npm install github:${{ github.repository }}#$TAG_NAME"
+
+          # ============ Cleanup Old Releases ============
+
+          # Define retention policy
+          if [ "$IS_PRERELEASE" == "true" ]; then
+             KEEP_COUNT=10
+             MATCH_REGEX="\-dev$"
+             echo "Cleaning up old dev releases (keeping last $KEEP_COUNT)..."
+          else
+             KEEP_COUNT=20
+             MATCH_REGEX="^v"
+             echo "Cleaning up old stable releases (keeping last $KEEP_COUNT)..."
+          fi
+
+          # List releases, filter by type, sort by date desc, skip kept count, delete rest
+          gh release list --limit 100 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[].tagName' \
+            | grep -E "$MATCH_REGEX" \
+            | tail -n +$((KEEP_COUNT + 1)) \
+            | while read -r DELETE_TAG; do
+                echo "Deleting old release: $DELETE_TAG"
+                gh release delete "$DELETE_TAG" -y --cleanup-tag || echo "Failed to delete $DELETE_TAG"
+            done
