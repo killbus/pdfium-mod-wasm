@@ -106,7 +106,7 @@ jobs:
       
       # ============ Cache Strategy (restore-only, save separately) ============
       - name: Restore Docker layers cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         id: cache-docker-restore
         with:
           path: /tmp/.buildx-cache
@@ -219,7 +219,7 @@ jobs:
       
       # ============ Save Caches (always, even on failure) ============
       - name: Save Docker layers cache
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         if: always() && steps.cache-docker-restore.outputs.cache-hit != 'true'
         with:
           path: /tmp/.buildx-cache
